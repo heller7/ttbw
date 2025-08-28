@@ -249,6 +249,9 @@ class TTBWDatabase:
 
     def _get_region_from_district(self, district: str) -> int:
         """Get region number from district name from config."""
+        if district is None:
+            return 1  # Default fallback for None
+        
         districts_config = self.config.get('districts', {})
 
         # Try to find the district in the config
@@ -389,6 +392,8 @@ class TTBWDatabase:
 
     def _get_name_variants(self, name: str) -> List[str]:
         """Get common name variants for fuzzy matching."""
+        if name is None:
+            return []
         name = name.lower().strip()
         variants = [name]  # Always include the original name
         
