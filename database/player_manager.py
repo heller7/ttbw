@@ -444,6 +444,11 @@ class PlayerManager:
                         else:
                             logger.debug(f"Player {first_name} {last_name} (birth year {birth_year}) is too old for age classes")
 
+            # NEW: Try to find player by historical name changes
+            historical_match = self._find_player_by_historical_name(first_name, last_name, club)
+            if historical_match:
+                return historical_match
+
             # Check if the club exists in the database at all
             cursor.execute("""
                 SELECT COUNT(*) FROM current_players WHERE LOWER(TRIM(club)) = LOWER(TRIM(?))
@@ -455,6 +460,67 @@ class PlayerManager:
                 logger.warning(f"CLUB NOT FOUND: Club '{club}' is not in the database - likely not part of considered regions")
                 return None
 
+            return None
+
+    def _find_player_by_historical_name(self, first_name: str, last_name: str, club: str) -> Optional[str]:
+        """
+        Find a player by searching the player history table for name changes.
+        This handles cases where a player has changed their name (e.g., due to marriage).
+        """
+        with sqlite3.connect(self.db_manager.db_path) as conn:
+            cursor = conn.cursor()
+            
+            # Search for players who previously had this name and club combination
+            # Look for the most recent historical record with this name
+            cursor.execute("""
+                SELECT DISTINCT ph.interne_lizenznr, ph.birth_year, ph.first_name, ph.last_name, ph.club
+                FROM player_history ph
+                INNER JOIN current_players cp ON ph.interne_lizenznr = cp.interne_lizenznr
+                WHERE LOWER(TRIM(ph.first_name)) = LOWER(TRIM(?))
+                AND LOWER(TRIM(ph.last_name)) = LOWER(TRIM(?))
+                AND LOWER(TRIM(ph.club)) = LOWER(TRIM(?))
+                AND ph.change_type IN ('INSERT', 'UPDATE')
+                ORDER BY ph.changed_at DESC
+            """, (first_name, last_name, club))
+            
+            results = cursor.fetchall()
+            
+            if results:
+                # Get the most recent historical record
+                player_id, birth_year, hist_first_name, hist_last_name, hist_club = results[0]
+                
+                # Check if the current player is age-eligible
+                if self._is_player_age_eligible(birth_year):
+                    # Get current player info for logging
+                    cursor.execute("""
+                        SELECT first_name, last_name, club FROM current_players 
+                        WHERE interne_lizenznr = ?
+                    """, (player_id,))
+                    
+                    current_info = cursor.fetchone()
+                    if current_info:
+                        current_first, current_last, current_club = current_info
+                        
+                        logger.info(f"HISTORICAL NAME MATCH: Tournament '{first_name} {last_name}' from {club} matched to current player '{current_first} {current_last}' from {current_club} (historical name: {hist_first_name} {hist_last_name})")
+                        
+                        # Log this as a fuzzy match for reporting
+                        self._log_fuzzy_match(
+                            tournament_name="",  # We don't have tournament name in this context
+                            db_name=f"{current_first} {current_last}",
+                            tournament_club=club,
+                            db_club=current_club,
+                            tournament_first=first_name,
+                            tournament_last=last_name,
+                            db_first=current_first,
+                            db_last=current_last
+                        )
+                        
+                        return player_id
+                    else:
+                        logger.warning(f"Historical name match found but current player {player_id} not found in current_players table")
+                else:
+                    logger.debug(f"Historical name match found for {first_name} {last_name} but player (birth year {birth_year}) is too old for age classes")
+            
             return None
     
     def _log_fuzzy_match(self, tournament_name: str, db_name: str, tournament_club: str, db_club: str,

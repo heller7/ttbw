@@ -4,6 +4,7 @@ Ranking processor for the TTBW system.
 
 import requests
 import re
+import os
 import logging
 from typing import Dict, List, Optional, Tuple
 from models.player import Player
@@ -22,18 +23,40 @@ class RankingProcessor:
         self.player_manager = PlayerManager(self.db)
         self.players: Dict[str, Player] = {}
         self.tournaments: Dict[str, TournamentConfig] = {}
-        self.regions: Dict[int, List[str]] = {}
+        self.regions: Dict[int, Dict[str, Dict[str, int]]] = {}
+        self.session = requests.Session()
+        self.unmatched_players = []
         self._load_tournament_config()
         self._load_region_config()
     
     def _load_tournament_config(self) -> None:
         """Load tournament configuration from config."""
         tournament_config = self.db.config.get('tournaments', {})
-        for tournament_id, points in tournament_config.items():
-            self.tournaments[str(tournament_id)] = TournamentConfig(
-                tournament_id=int(tournament_id),
-                points=points
-            )
+        for tournament_name, tournament_info in tournament_config.items():
+            if isinstance(tournament_info, dict):
+                # New format: tournament_name -> {tournament_id: X, points: Y}
+                tournament_id = tournament_info.get('tournament_id')
+                points = tournament_info.get('points', 1)
+            else:
+                # Old format: tournament_name -> points
+                tournament_id = tournament_name
+                points = tournament_info
+            
+            # Try to convert tournament_id to int if it's numeric
+            try:
+                tournament_id_int = int(tournament_id)
+                self.tournaments[tournament_name] = TournamentConfig(
+                    tournament_id=tournament_id_int,
+                    points=points
+                )
+            except (ValueError, TypeError):
+                # If tournament_id is not numeric, use the tournament name as key
+                # and create a dummy tournament ID
+                logger.warning(f"Tournament ID '{tournament_id}' is not numeric, using tournament name as key")
+                self.tournaments[tournament_name] = TournamentConfig(
+                    tournament_id=hash(tournament_name) % 1000000,  # Create a numeric ID from hash
+                    points=points
+                )
     
     def _load_region_config(self) -> None:
         """Load region configuration from config."""
@@ -41,8 +64,7 @@ class RankingProcessor:
         for district_name, district_info in districts_config.items():
             region = district_info.get('region', 1)
             if region not in self.regions:
-                self.regions[region] = []
-            self.regions[region].append(district_name)
+                self.regions[region] = {}
     
     def load_players_from_database(self) -> None:
         """Load all players from database into memory."""
@@ -65,101 +87,233 @@ class RankingProcessor:
         
         logger.info(f"Loaded {len(self.players)} players from database")
     
-    def load_competitions_from_api(self, api_url: str) -> List[Dict[str, str]]:
-        """
-        Load competition data from external API.
-        Returns list of competition dictionaries.
-        """
+    def load_tournament_participants(self) -> None:
+        """Load tournament participants from XML files and web API."""
+        for tournament_name in sorted(self.tournaments.keys()):
+            self._load_tournament_data(tournament_name)
+    
+    def _load_tournament_data(self, tournament_name: str) -> None:
+        """Load data for a specific tournament."""
+        tournament = self.tournaments[tournament_name]
+        
+        # Initialize participants and competitions attributes
+        tournament.participants = {}
+        tournament.competitions = {}
+        
+        # Load participants from XML file if it exists
+        xml_filename = self._replace_umlauts(f"{tournament_name}_Turnierteilnehmer.xml")
+        if os.path.exists(xml_filename):
+            logger.info(f"Loading participants from XML file: {xml_filename}")
+            self._load_participants_from_xml(tournament_name, xml_filename)
+            logger.info(f"Loaded {len(tournament.participants)} participants from XML")
+        else:
+            logger.info(f"No XML file found for {tournament_name}, will use data matching")
+        
+        # Load competitions from web API
+        logger.info(f"Loading competitions for {tournament_name} from API...")
+        self._load_competitions_from_api(tournament_name)
+        logger.info(f"Found {len(tournament.competitions)} competitions")
+    
+    def _load_participants_from_xml(self, tournament_name: str, filename: str) -> None:
+        """Load tournament participants from XML file."""
+        tournament = self.tournaments[tournament_name]
+        
         try:
-            response = requests.get(api_url, timeout=30)
-            response.raise_for_status()
-            
-            # Extract competition IDs using regex
-            content = response.text
-            competition_pattern = r'competition_id["\']?\s*:\s*["\']?(\d+)["\']?'
-            competitions = re.findall(competition_pattern, content)
-            
-            logger.info(f"Found {len(competitions)} competitions from API")
-            return [{'id': comp_id} for comp_id in competitions]
-            
-        except requests.RequestException as e:
-            logger.error(f"Error loading competitions from API: {e}")
-            return []
+            with open(filename, encoding='utf-8') as f:
+                for line_num, line in enumerate(f, 1):
+                    pattern = r'<person licence-nr="(\d+)" lastname="(.*?)" club-name="(.*?)".*?firstname="(.*?)".*?club-nr="(\d+)"'
+                    match = re.search(pattern, line)
+                    if match:
+                        player_id, last_name, club, first_name, club_number = match.groups()
+                        name_club_id = self._replace_umlauts(f"{first_name}{last_name}{club_number}")
+                        tournament.participants[name_club_id] = player_id
         except Exception as e:
-            logger.error(f"Unexpected error loading competitions: {e}")
-            return []
+            logger.error(f"Error loading XML file {filename}: {e}")
+            tournament.participants = {}
     
-    def process_tournament_results(self, tournament_data: List[Dict[str, str]]) -> None:
-        """
-        Process tournament results and update player points.
-        tournament_data should contain player results with fields:
-        - first_name, last_name, club, club_number, tournament_id, result
-        """
-        for result in tournament_data:
-            first_name = result.get('first_name', '')
-            last_name = result.get('last_name', '')
-            club = result.get('club', '')
-            club_number = result.get('club_number')
-            tournament_id = result.get('tournament_id', '')
-            result_value = result.get('result', 0)
+    def _load_competitions_from_api(self, tournament_name: str) -> None:
+        """Load competitions for a tournament from the web API."""
+        tournament = self.tournaments[tournament_name]
+        
+        # Determine federation based on tournament name
+        api_config = self.db.config.get('api', {})
+        federation = api_config.get('federation_arge') if tournament_name.startswith("BaWü") else api_config.get('federation_ttbw')
+        
+        if not federation:
+            logger.warning(f"No federation configuration found for {tournament_name}")
+            return
+        
+        url = f"{api_config.get('nuliga_base_url')}{api_config.get('tournament_base_url')}{tournament.tournament_id}&{federation}"
+        
+        try:
+            response = self.session.get(url, timeout=30)
+            response.raise_for_status()
+            content = response.text
             
-            if not all([first_name, last_name, club, tournament_id]):
-                logger.warning(f"Incomplete tournament result: {result}")
-                continue
+            tournament.competitions = {}
+            pattern = r'<td>\s*<b>(\S+ \d+) Einzel</b>.*?<td> ja<.*?<a href=".*?competition=(\d+)">Teilnehmer'
             
-            # Find player in database
-            player_id = self.player_manager.find_player_by_name_and_club(
-                first_name, last_name, club, club_number
-            )
-            
-            if player_id and player_id in self.players:
-                self._update_player_results(player_id, tournament_id, result_value)
-            else:
-                logger.warning(f"Player not found: {first_name} {last_name} from {club}")
+            for match in re.finditer(pattern, content, re.DOTALL):
+                competition_name, competition_id = match.groups()
+                tournament.competitions[int(competition_id)] = competition_name
+                
+        except Exception as e:
+            logger.error(f"Error loading competitions for {tournament_name}: {e}")
+            tournament.competitions = {}
     
-    def _update_player_results(self, player_id: str, tournament_id: str, result: int) -> None:
-        """Update player's tournament results and points."""
+    def process_tournament_results(self) -> None:
+        """Process results for all tournaments."""
+        for tournament_name in sorted(self.tournaments.keys()):
+            tournament = self.tournaments[tournament_name]
+            if hasattr(tournament, 'competitions'):
+                for competition_id, competition_name in sorted(tournament.competitions.items()):
+                    self._process_competition_results(tournament_name, competition_id, competition_name)
+    
+    def _process_competition_results(self, tournament_name: str, competition_id: int, competition_name: str) -> None:
+        """Process results for a specific competition."""
+        api_config = self.db.config.get('api', {})
+        federation = api_config.get('federation_arge') if tournament_name.startswith("BaWü") else api_config.get('federation_ttbw')
+        
+        if not federation:
+            logger.warning(f"No federation configuration found for {tournament_name}")
+            return
+        
+        url = f"{api_config.get('nuliga_base_url')}{api_config.get('competition_base_url')}{federation}&competition={competition_id}"
+        
+        try:
+            response = self.session.get(url, timeout=30)
+            response.raise_for_status()
+            content = response.text
+            
+            pattern = r'<td>(\d+) </td>\s*<td>\s*(.*?), (.*?)\s*</td>\s*<td>\s*(.*?) \((\d+)\)'
+            
+            matches_found = 0
+            players_matched = 0
+            
+            for match in re.finditer(pattern, content, re.DOTALL):
+                position, last_name, first_name, club, club_number = match.groups()
+                position = int(position)
+                matches_found += 1
+                
+                # Try to find the player by matching name and club
+                player_id = self._find_player_by_name_and_club(first_name, last_name, club, club_number)
+                
+                if player_id:
+                    players_matched += 1
+                    self._update_player_results(player_id, tournament_name, competition_name, position)
+                else:
+                    logger.warning(f"Could not match player: {first_name} {last_name} from {club} (club #{club_number})")
+                    
+                    # Track unmatched player for reporting
+                    self.unmatched_players.append({
+                        'first_name': first_name,
+                        'last_name': last_name,
+                        'club': club,
+                        'club_number': club_number,
+                        'tournament': tournament_name,
+                        'competition': competition_name,
+                        'position': position
+                    })
+            
+            if matches_found > 0:
+                logger.info(f"Competition {competition_name}: Found {matches_found} results, matched {players_matched} players")
+                
+        except Exception as e:
+            logger.error(f"Error processing competition {competition_id}: {e}")
+    
+    def _find_player_by_name_and_club(self, first_name: str, last_name: str, club: str, club_number: str) -> Optional[str]:
+        """Find a player by matching name and club information."""
+        # First try to find by exact match using the XML participants if available
+        for tournament_name, tournament in self.tournaments.items():
+            if hasattr(tournament, 'participants'):
+                name_club_id = self._replace_umlauts(f"{first_name}{last_name}{club_number}")
+                if name_club_id in tournament.participants:
+                    return tournament.participants[name_club_id]
+        
+        # Use database for better matching (includes historical club changes)
+        player_id = self.player_manager.find_player_by_name_and_club(first_name, last_name, club, club_number)
+        if player_id:
+            return player_id
+        
+        # Fallback to in-memory matching if database didn't find anything
+        for player_id, player in self.players.items():
+            # Try different matching strategies
+            if (self._normalize_name(player.first_name) == self._normalize_name(first_name) and
+                    self._normalize_name(player.last_name) == self._normalize_name(last_name) and
+                    self._normalize_club(player.club) == self._normalize_club(club)):
+                return player_id
+            
+            # Also try matching with club number if available
+            if club_number and hasattr(player, 'club_number'):
+                if (self._normalize_name(player.first_name) == self._normalize_name(first_name) and
+                        self._normalize_name(player.last_name) == self._normalize_name(last_name) and
+                        str(player.club_number) == club_number):
+                    return player_id
+        
+        return None
+    
+    def _normalize_name(self, name: str) -> str:
+        """Normalize a name for comparison by removing spaces and converting to lowercase."""
+        return re.sub(r'\s+', '', name.lower())
+    
+    def _normalize_club(self, club: str) -> str:
+        """Normalize a club name for comparison by removing spaces and converting to lowercase."""
+        return re.sub(r'\s+', '', club.lower())
+    
+    def _replace_umlauts(self, text: str) -> str:
+        """Replace German umlauts with their ASCII equivalents."""
+        replacements = {
+            'ö': 'oe', 'ä': 'ae', 'ü': 'ue', 'ß': 'ss',
+            'Ö': 'Oe', 'Ä': 'Ae', 'Ü': 'Ue'
+        }
+        for umlaut, replacement in replacements.items():
+            text = text.replace(umlaut, replacement)
+        return text
+    
+    def _update_player_results(self, player_id: str, tournament_name: str, competition_name: str, position: int) -> None:
+        """Update player results and points."""
         if player_id not in self.players:
             return
         
         player = self.players[player_id]
+        tournament = self.tournaments[tournament_name]
         
-        # Initialize tournament results if not exists
-        if tournament_id not in player.tournaments:
-            player.tournaments[tournament_id] = {}
+        # Check if player is age-eligible for current config before processing
+        age_classes = self.db.config.get('age_classes', {})
+        oldest_eligible_birth_year = min(age_classes.keys()) if age_classes else 2000
+        if player.birth_year < oldest_eligible_birth_year:
+            logger.debug(f"Skipping tournament results for player {player.first_name} {player.last_name} - birth year {player.birth_year} is too old for current age classes")
+            return
         
-        # Update result
-        player.tournaments[tournament_id]['result'] = result
+        # Update regional classification
+        competition_key = f"{player.gender} {player.age_class}"
+        if player.region not in self.regions:
+            self.regions[player.region] = {}
+        if competition_key not in self.regions[player.region]:
+            self.regions[player.region][competition_key] = {}
+        self.regions[player.region][competition_key][player_id] = 1
         
-        # Calculate points based on tournament configuration
-        if tournament_id in self.tournaments:
-            tournament_config = self.tournaments[tournament_id]
-            points = tournament_config.points
-            
-            # Simple point calculation (can be enhanced)
-            if result == 1:  # First place
-                player.points += points
-            elif result == 2:  # Second place
-                player.points += points * 0.8
-            elif result == 3:  # Third place
-                player.points += points * 0.6
-            elif result <= 8:  # Top 8
-                player.points += points * 0.4
-            elif result <= 16:  # Top 16
-                player.points += points * 0.2
-            
-            logger.debug(f"Updated {player.first_name} {player.last_name} with {points} points for result {result}")
+        # Calculate and update points
+        points = (100 - position) * tournament.points
+        if player.qttr:
+            points += player.qttr / 1000
+        player.points += points
+        
+        # Update tournament results
+        if tournament_name not in player.tournaments:
+            player.tournaments[tournament_name] = {}
+        player.tournaments[tournament_name][competition_name] = position
+    
+    def get_unmatched_players(self) -> List[Dict]:
+        """Get list of unmatched players for reporting."""
+        return self.unmatched_players
     
     def get_player_ranking(self, region: Optional[int] = None, age_class: Optional[int] = None,
                           gender: Optional[str] = None) -> List[Player]:
-        """
-        Get player ranking based on optional filters.
-        Returns sorted list of players by points.
-        """
+        """Get ranking of players based on filters."""
         filtered_players = []
         
         for player in self.players.values():
-            # Apply filters
             if region is not None and player.region != region:
                 continue
             if age_class is not None and player.age_class != age_class:
